@@ -5,7 +5,7 @@ const nextConfig: NextConfig = {
     turbopackFileSystemCacheForDev: false,
   },
   "allowedDevOrigins": [
-    "http://localhost:3000",
+    "http://localhost",
     "192.168.0.42",
     "http://"
   ]

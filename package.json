@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "import-data": "tsx scripts/import-game-data.mts"
   },
   "dependencies": {
     "next": "16.3.0-preview.2",
@@ -20,7 +21,10 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.3.0-preview.2",
+    "pathofexile-dat": "^15.1.0",
+    "pathofexile-dat-schema": "^8.0.0",
     "tailwindcss": "^4",
+    "tsx": "^4.19.4",
     "typescript": "^5"
   }
 }
