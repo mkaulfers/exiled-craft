@@ -17,12 +17,24 @@ import {
   getFileInfo,
   readIndexBundle,
 } from 'pathofexile-dat/bundles.js'
-import type { SchemaFile, SchemaEnumeration } from 'pathofexile-dat-schema'
+import type { SchemaFile } from 'pathofexile-dat-schema'
 import { SCHEMA_URL, SCHEMA_VERSION } from 'pathofexile-dat-schema'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import { parseDat64, readAllRows, colSize } from './lib/dat-reader.mjs'
 import type { Dat64File, ColHeader, ColType, ColValue } from './lib/dat-reader.mjs'
+import { generateCatalogFiles } from './lib/generated-codegen.mjs'
+import { buildGeneratedCatalog } from './lib/generated-grouping.mjs'
+import { validateGeneratedCatalog, validateSourceRows } from './lib/generated-validation.mjs'
+import type {
+  ItemBaseRow,
+  ItemClassRow,
+  ModRow,
+  ModStatRow,
+  SpawnWeightRow,
+  StatRow,
+  TagRow,
+} from './lib/generated-model.mjs'
 
 // ─────────────────────────────────────────────
 // CLI args
@@ -173,26 +185,6 @@ function makeEnumResolver(schema: SchemaFile, enumName: string): EnumResolver {
 }
 
 // ─────────────────────────────────────────────
-// Row types
-// ─────────────────────────────────────────────
-
-interface StatRow       { id: string; isLocal: boolean; isWeaponLocal: boolean }
-interface TagRow        { id: string; displayString: string; name: string }
-interface ItemClassRow  { id: string; name: string }
-interface ModStatRow    { statId: string; min: number; max: number }
-interface SpawnWeightRow{ tag: string; weight: number }
-interface ModRow {
-  id: string; name: string; domain: string; generationType: string
-  level: number; maxLevel: number; isEssenceOnly: boolean; modTypeName: string
-  stats: ModStatRow[]; spawnWeights: SpawnWeightRow[]
-}
-interface ItemBaseRow {
-  id: string; name: string; itemClassId: string
-  width: number; height: number; dropLevel: number
-  implicitModIds: string[]; tagIds: string[]
-}
-
-// ─────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────
 
@@ -306,14 +298,24 @@ async function main(): Promise<void> {
       const keyRef = statKeys[slot]![i]
       if (keyRef != null) {
         const stat = statsByRow.get(keyRef)
-        if (stat) modStats.push({ statId: stat.id, min: statMins[slot]![i]!, max: statMaxs[slot]![i]! })
+        const min = statMins[slot]?.[i]
+        const max = statMaxs[slot]?.[i]
+        modStats.push({
+          statId: stat?.id ?? `__MISSING_STAT_ROW_${keyRef}`,
+          min: typeof min === 'number' ? min : Number.NaN,
+          max: typeof max === 'number' ? max : Number.NaN,
+        })
       }
     }
     const spawnWeights: SpawnWeightRow[] = (spawnTagRefs[i] ?? []).reduce<SpawnWeightRow[]>(
       (acc, tagRef, j) => {
         if (tagRef != null) {
           const tag = tagsByRow.get(tagRef)
-          if (tag) acc.push({ tag: tag.id, weight: spawnVals[i]![j]! })
+          const weight = spawnVals[i]?.[j]
+          acc.push({
+            tag: tag?.id ?? `__MISSING_TAG_ROW_${tagRef}`,
+            weight: typeof weight === 'number' ? weight : null,
+          })
         }
         return acc
       }, [])
@@ -347,31 +349,31 @@ async function main(): Promise<void> {
     const classRef = baseClassRefs[i]
     const itemClass = classRef != null ? classesByRow.get(classRef) : null
     const implicitModIds = (baseImplicitRefs[i] ?? []).reduce<string[]>((acc, ref) => {
-      if (ref != null) { const mod = modsByRow.get(ref); if (mod) acc.push(mod) }
+      if (ref != null) acc.push(modsByRow.get(ref) ?? `__MISSING_MOD_ROW_${ref}`)
       return acc
     }, [])
     const tagIds = (baseTagRefs[i] ?? []).reduce<string[]>((acc, ref) => {
-      if (ref != null) { const tag = tagsByRow.get(ref); if (tag) acc.push(tag.id) }
+      if (ref != null) acc.push(tagsByRow.get(ref)?.id ?? `__MISSING_TAG_ROW_${ref}`)
       return acc
     }, [])
     return {
-      id, name: baseNames[i]!, itemClassId: itemClass?.id ?? 'UNKNOWN',
+      id, name: baseNames[i]!, itemClassId: itemClass?.id ?? `__MISSING_ITEM_CLASS_ROW_${classRef ?? 'NULL'}`,
       width: baseWidths[i]!, height: baseHeights[i]!, dropLevel: baseDropLevels[i]!,
       implicitModIds, tagIds,
     }
   })
 
-  // ── Code generation ──────────────────────────────────────────────────────
-  console.log('\n[Output] Generating TypeScript files...')
-  await fs.mkdir(OUTPUT_DIR, { recursive: true })
+  // ── Validation + code generation ────────────────────────────────────────
+  console.log('\n[Validation] Checking source rows...')
+  const sourceRows = { stats, tags, itemClasses, mods, itemBases }
+  validateSourceRows(sourceRows)
 
-  await genTypes(schema)
-  await genStats(stats)
-  await genTags(tags)
-  await genItemClasses(itemClasses)
-  await genMods(mods)
-  await genItemBases(itemBases)
-  await genIndex()
+  console.log('\n[Grouping] Building generated catalog...')
+  const catalog = buildGeneratedCatalog(sourceRows)
+  validateGeneratedCatalog(catalog)
+
+  console.log('\n[Output] Generating grouped TypeScript files...')
+  await generateCatalogFiles(OUTPUT_DIR, schema, catalog)
 
   console.log('\n✓ Import complete.')
   console.log(`  stats:        ${stats.length}`)
@@ -379,203 +381,8 @@ async function main(): Promise<void> {
   console.log(`  item classes: ${itemClasses.length}`)
   console.log(`  mods:         ${mods.length}`)
   console.log(`  item bases:   ${itemBases.length}`)
+  console.log(`  mod families: ${catalog.modFamilies.length}`)
   console.log(`\n  Output: ${OUTPUT_DIR}`)
-}
-
-// ─────────────────────────────────────────────
-// Code generators
-// ─────────────────────────────────────────────
-
-const REGEN_NOTE =
-  '// AUTO-GENERATED — do not edit manually.\n' +
-  '// Regenerate: npm run import-data -- --game-dir <path-to-poe2>\n'
-
-async function emit(filename: string, content: string): Promise<void> {
-  await fs.writeFile(path.join(OUTPUT_DIR, filename), content, 'utf8')
-  console.log(`  ✓ ${filename}`)
-}
-
-const q = (v: string) => JSON.stringify(v)
-
-async function genTypes(schema: SchemaFile): Promise<void> {
-  const unionValues = (e: SchemaEnumeration) =>
-    [...new Set(e.enumerators.filter((v): v is string => v !== null))]
-      .map((v) => `  | ${q(v)}`)
-      .join('\n')
-  const modDomains  = schema.enumerations.find((e) => e.name === 'ModDomains')!
-  const modGenTypes = schema.enumerations.find((e) => e.name === 'ModGenerationType')!
-
-  await emit('types.ts', `${REGEN_NOTE}
-export interface Stat {
-  readonly id: string;
-  readonly isLocal: boolean;
-  readonly isWeaponLocal: boolean;
-}
-
-export interface Tag {
-  readonly id: string;
-  readonly displayString: string;
-  readonly name: string;
-}
-
-export interface ItemClass {
-  readonly id: string;
-  readonly name: string;
-}
-
-export interface ModStat {
-  readonly statId: string;
-  readonly min: number;
-  readonly max: number;
-}
-
-export interface SpawnWeight {
-  readonly tag: string;
-  readonly weight: number;
-}
-
-export interface Mod {
-  readonly id: string;
-  readonly name: string;
-  readonly domain: ModDomain;
-  readonly generationType: ModGenerationType;
-  /** Minimum item level required for this mod to spawn. */
-  readonly level: number;
-  /** Maximum ilvl at which this mod is valid (0 = no cap). */
-  readonly maxLevel: number;
-  readonly isEssenceOnly: boolean;
-  readonly modTypeName: string;
-  readonly stats: readonly ModStat[];
-  readonly spawnWeights: readonly SpawnWeight[];
-}
-
-export interface ItemBase {
-  readonly id: string;
-  readonly name: string;
-  readonly itemClassId: string;
-  readonly width: number;
-  readonly height: number;
-  readonly dropLevel: number;
-  readonly implicitModIds: readonly string[];
-  readonly tagIds: readonly string[];
-}
-
-export type ModDomain =
-${unionValues(modDomains)};
-
-export type ModGenerationType =
-${unionValues(modGenTypes)};
-`)
-}
-
-async function genStats(stats: StatRow[]): Promise<void> {
-  const rows = stats
-    .map((s) => `  { id: ${q(s.id)}, isLocal: ${s.isLocal}, isWeaponLocal: ${s.isWeaponLocal} },`)
-    .join('\n')
-  await emit('stats.ts', `${REGEN_NOTE}
-import type { Stat } from './types.js';
-
-export const STATS: readonly Stat[] = [
-${rows}
-];
-
-export const STATS_BY_ID: ReadonlyMap<string, Stat> =
-  new Map(STATS.map((s) => [s.id, s]));
-`)
-}
-
-async function genTags(tags: TagRow[]): Promise<void> {
-  const rows = tags
-    .map((t) => `  { id: ${q(t.id)}, displayString: ${q(t.displayString)}, name: ${q(t.name)} },`)
-    .join('\n')
-  await emit('tags.ts', `${REGEN_NOTE}
-import type { Tag } from './types.js';
-
-export const TAGS: readonly Tag[] = [
-${rows}
-];
-
-export const TAGS_BY_ID: ReadonlyMap<string, Tag> =
-  new Map(TAGS.map((t) => [t.id, t]));
-`)
-}
-
-async function genItemClasses(itemClasses: ItemClassRow[]): Promise<void> {
-  const rows = itemClasses
-    .map((c) => `  { id: ${q(c.id)}, name: ${q(c.name)} },`)
-    .join('\n')
-  await emit('item-classes.ts', `${REGEN_NOTE}
-import type { ItemClass } from './types.js';
-
-export const ITEM_CLASSES: readonly ItemClass[] = [
-${rows}
-];
-
-export const ITEM_CLASSES_BY_ID: ReadonlyMap<string, ItemClass> =
-  new Map(ITEM_CLASSES.map((c) => [c.id, c]));
-`)
-}
-
-async function genMods(mods: ModRow[]): Promise<void> {
-  const rows = mods.map((m) => {
-    const statsLit = m.stats.length === 0 ? '[]'
-      : `[${m.stats.map((st) => `{ statId: ${q(st.statId)}, min: ${st.min}, max: ${st.max} }`).join(', ')}]`
-    const weightsLit = m.spawnWeights.length === 0 ? '[]'
-      : `[${m.spawnWeights.map((w) => `{ tag: ${q(w.tag)}, weight: ${w.weight} }`).join(', ')}]`
-    return (
-      `  { id: ${q(m.id)}, name: ${q(m.name)}, domain: ${q(m.domain)}, ` +
-      `generationType: ${q(m.generationType)}, level: ${m.level}, maxLevel: ${m.maxLevel}, ` +
-      `isEssenceOnly: ${m.isEssenceOnly}, modTypeName: ${q(m.modTypeName)}, ` +
-      `stats: ${statsLit}, spawnWeights: ${weightsLit} },`
-    )
-  }).join('\n')
-  await emit('mods.ts', `${REGEN_NOTE}
-import type { Mod } from './types.js';
-
-export const MODS: readonly Mod[] = [
-${rows}
-];
-
-export const MODS_BY_ID: ReadonlyMap<string, Mod> =
-  new Map(MODS.map((m) => [m.id, m]));
-`)
-}
-
-async function genItemBases(itemBases: ItemBaseRow[]): Promise<void> {
-  const rows = itemBases.map((b) => {
-    const implLit = b.implicitModIds.length === 0 ? '[]' : `[${b.implicitModIds.map(q).join(', ')}]`
-    const tagLit  = b.tagIds.length === 0          ? '[]' : `[${b.tagIds.map(q).join(', ')}]`
-    return (
-      `  { id: ${q(b.id)}, name: ${q(b.name)}, itemClassId: ${q(b.itemClassId)}, ` +
-      `width: ${b.width}, height: ${b.height}, dropLevel: ${b.dropLevel}, ` +
-      `implicitModIds: ${implLit}, tagIds: ${tagLit} },`
-    )
-  }).join('\n')
-  await emit('item-bases.ts', `${REGEN_NOTE}
-import type { ItemBase } from './types.js';
-
-export const ITEM_BASES: readonly ItemBase[] = [
-${rows}
-];
-
-export const ITEM_BASES_BY_ID: ReadonlyMap<string, ItemBase> =
-  new Map(ITEM_BASES.map((b) => [b.id, b]));
-`)
-}
-
-async function genIndex(): Promise<void> {
-  await emit('index.ts', `${REGEN_NOTE}
-export type {
-  Stat, Tag, ItemClass, ModStat, SpawnWeight, Mod, ItemBase,
-  ModDomain, ModGenerationType,
-} from './types.js';
-
-export { STATS, STATS_BY_ID }                  from './stats.js';
-export { TAGS, TAGS_BY_ID }                    from './tags.js';
-export { ITEM_CLASSES, ITEM_CLASSES_BY_ID }    from './item-classes.js';
-export { MODS, MODS_BY_ID }                    from './mods.js';
-export { ITEM_BASES, ITEM_BASES_BY_ID }        from './item-bases.js';
-`)
 }
 
 // ─────────────────────────────────────────────

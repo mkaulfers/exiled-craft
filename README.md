@@ -18,6 +18,18 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
+## Generated Game Data
+
+Game data is generated from a local Path of Exile 2 installation:
+
+```bash
+npm run import-data -- --game-dir "C:/Program Files (x86)/Steam/steamapps/common/Path of Exile 2"
+```
+
+The importer writes a structured catalog under `app/types/generated/`. Large tables are split into chunked modules, item bases are grouped by item class, and modifiers are grouped into families with sorted tiers. The public entrypoint is `app/types/generated/index.ts`.
+
+Generated imports fail before writing files if references are broken, including missing stats, tags, item classes, implicit mods, unknown enum values, duplicate IDs, or malformed spawn-weight values. Added or removed game IDs are reported through the generated manifest diff so updates are visible during import.
+
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
 ## Learn More
